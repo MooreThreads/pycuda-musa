@@ -23,6 +23,18 @@ def get_nvcc_version(nvcc):
     return stdout.decode("utf-8", "replace")
 
 
+@memoize
+def get_mcc_version(mcc):
+    cmdline = [mcc, "--version"]
+    result, stdout, _stderr = call_capture_output(cmdline)
+
+    if result != 0 or not stdout:
+        warn("MCC version could not be determined.", stacklevel=2)
+        stdout = b"mcc unknown version"
+
+    return stdout.decode("utf-8", "replace")
+
+
 def _new_md5():
     try:
         import hashlib
@@ -64,6 +76,49 @@ def preprocess_source(source, options, nvcc):
 
         raise CompileError(
             "nvcc preprocessing of %s failed with ridiculously "
+            "small code output - likely unsupported compiler." % source_path,
+            cmdline,
+            stderr=stderr.decode("utf-8", "replace"),
+        )
+
+    unlink(source_path)
+
+    preprocessed_str = stdout.decode("utf-8", "replace")
+
+    # remove the temporary filename from the preprocessed source code to get reproducible hashes
+    return preprocessed_str.replace(os.path.basename(source_path), "")
+
+
+def preprocess_source_musa(source, options, mcc):
+    """Preprocess MUSA source using mcc. Uses .mu suffix for MUSA source files."""
+    handle, source_path = mkstemp(suffix=".mu")
+
+    with open(source_path, "w") as outf:
+        outf.write(source)
+
+    os.close(handle)
+
+    cmdline = [mcc, "--preprocess", *options, source_path]
+    if "win32" in sys.platform:
+        cmdline.extend(["--compiler-options", "-EP"])
+    else:
+        cmdline.extend(["--compiler-options", "-P"])
+
+    result, stdout, stderr = call_capture_output(cmdline, error_on_nonzero=False)
+
+    if result != 0:
+        from pycuda.driver import CompileError
+
+        raise CompileError(
+            "mcc preprocessing of %s failed" % source_path, cmdline, stderr=stderr
+        )
+
+    # sanity check
+    if len(stdout) < 0.5 * len(source):
+        from pycuda.driver import CompileError
+
+        raise CompileError(
+            "mcc preprocessing of %s failed with ridiculously "
             "small code output - likely unsupported compiler." % source_path,
             cmdline,
             stderr=stderr.decode("utf-8", "replace"),
@@ -182,6 +237,112 @@ def compile_plain(source, options, keep, nvcc, cache_dir, target="cubin"):
     return result_data
 
 
+def compile_plain_musa(source, options, keep, mcc, cache_dir, target="cubin"):
+    """Compile MUSA source using mcc. Uses .mu suffix for MUSA source files."""
+    from os.path import join
+
+    assert target in ["cubin", "ptx", "fatbin"]
+
+    if cache_dir:
+        checksum = _new_md5()
+
+        if "#include" in source:
+            checksum.update(preprocess_source_musa(source, options, mcc).encode("utf-8"))
+        else:
+            checksum.update(source.encode("utf-8"))
+
+        for option in options:
+            checksum.update(option.encode("utf-8"))
+        checksum.update(get_mcc_version(mcc).encode("utf-8"))
+        from pycuda.characterize import platform_bits
+
+        checksum.update(str(platform_bits()).encode("utf-8"))
+
+        cache_file = checksum.hexdigest()
+        cache_path = join(cache_dir, cache_file + "." + target)
+
+        try:
+            with open(cache_path, "rb") as cache_file:
+                return cache_file.read()
+
+        except Exception as e:
+            warn(f"Could not read cache file '{cache_path}': {e!s}", stacklevel=1)
+
+    from tempfile import mkdtemp
+
+    file_dir = mkdtemp()
+    file_root = "kernel"
+
+    mu_file_name = file_root + ".mu"
+    mu_file_path = join(file_dir, mu_file_name)
+
+    with open(mu_file_path, "w") as outf:
+        outf.write(str(source))
+
+    if keep:
+        options = options[:]
+        options.append("--keep")
+
+        print("*** compiler output in %s" % file_dir)
+
+    cmdline = [mcc, "--" + target, *options, mu_file_name]
+    result, stdout, stderr = call_capture_output(
+        cmdline, cwd=file_dir, error_on_nonzero=False
+    )
+
+    try:
+        result_f = open(join(file_dir, file_root + "." + target), "rb")  # noqa: SIM115
+    except OSError:
+        no_output = True
+    else:
+        no_output = False
+
+    if result != 0 or (no_output and (stdout or stderr)):
+        if result == 0:
+            warn(
+                "PyMUSA: mcc exited with status 0, but appears to have "
+                "encountered an error", stacklevel=2
+            )
+        from pycuda.driver import CompileError
+
+        raise CompileError(
+            "mcc compilation of %s failed" % mu_file_path,
+            cmdline,
+            stdout=stdout.decode("utf-8", "replace"),
+            stderr=stderr.decode("utf-8", "replace"),
+        )
+
+    if stdout or stderr:
+        lcase_err_text = (stdout + stderr).decode("utf-8", "replace").lower()
+        if "demoted" in lcase_err_text or "demoting" in lcase_err_text:
+            warn(
+                "mcc said it demoted types in source code it "
+                "compiled--this is likely not what you want.",
+                stacklevel=4,
+            )
+        warn(
+            "The MUSA compiler succeeded, but said the following:\n"
+            + (stdout + stderr).decode("utf-8", "replace"),
+            stacklevel=4,
+        )
+
+    result_data = result_f.read()
+    result_f.close()
+
+    if cache_dir:
+        with open(cache_path, "wb") as outf:
+            outf.write(result_data)
+
+    if not keep:
+        from os import listdir, rmdir, unlink
+
+        for name in listdir(file_dir):
+            unlink(join(file_dir, name))
+        rmdir(file_dir)
+
+    return result_data
+
+
 def _get_per_user_string():
     try:
         from os import getuid
@@ -207,6 +368,12 @@ def _find_pycuda_include_path():
 DEFAULT_NVCC_FLAGS = [
     flag.strip()
     for flag in os.environ.get("PYCUDA_DEFAULT_NVCC_FLAGS", "").split()
+    if flag.strip()
+]
+
+DEFAULT_MCC_FLAGS = [
+    flag.strip()
+    for flag in os.environ.get("PYMUSA_DEFAULT_MCC_FLAGS", "").split()
     if flag.strip()
 ]
 
@@ -290,6 +457,87 @@ def compile(
     return compile_plain(source, options, keep, nvcc, cache_dir, target)
 
 
+def compile_musa(
+    source,
+    mcc="mcc",
+    options=None,
+    keep=False,
+    no_extern_c=False,
+    arch=None,
+    code=None,
+    cache_dir=None,
+    include_dirs=None,
+    target="cubin",
+):
+    """Compile MUSA source using mcc compiler. Replaces compile() for MUSA targets."""
+    if include_dirs is None:
+        include_dirs = []
+    assert target in ["cubin", "ptx", "fatbin"]
+
+    if not no_extern_c:
+        source = 'extern "C" {\n%s\n}\n' % source
+
+    if options is None:
+        options = DEFAULT_MCC_FLAGS
+
+    options = options[:]
+    if arch is None:
+        from pycuda.driver import Error
+
+        try:
+            from pycuda.driver import Context
+
+            arch = "mp_%d%d" % Context.get_device().compute_capability()
+        except Error:
+            pass
+
+    from pycuda.driver import CUDA_DEBUGGING
+
+    if CUDA_DEBUGGING:
+        cache_dir = False
+        keep = True
+        options.extend(["-g", "-G"])
+
+    if "PYMUSA_CACHE_DIR" in os.environ and cache_dir is None:
+        cache_dir = os.environ["PYMUSA_CACHE_DIR"]
+    elif "PYCUDA_CACHE_DIR" in os.environ and cache_dir is None:
+        cache_dir = os.environ["PYCUDA_CACHE_DIR"]
+
+    if "PYMUSA_DISABLE_CACHE" in os.environ or "PYCUDA_DISABLE_CACHE" in os.environ:
+        cache_dir = False
+
+    if cache_dir is None:
+        import platformdirs
+
+        cache_dir = os.path.join(
+            platformdirs.user_cache_dir("pycuda", "pycuda"), "musa-compiler-cache-v1"
+        )
+
+        from os import makedirs
+        makedirs(cache_dir, exist_ok=True)
+
+    if arch is not None:
+        options.extend(["-arch", arch])
+
+    if code is not None:
+        options.extend(["-code", code])
+
+    if (
+            ("darwin" in sys.platform and sys.maxsize == 9223372036854775807)
+            or
+            ("win32" in sys.platform and sys.maxsize == 9223372036854775807)):
+        options.append("-m64")
+    elif "win32" in sys.platform and sys.maxsize == 2147483647:
+        options.append("-m32")
+
+    include_dirs = [*include_dirs, _find_pycuda_include_path()]
+
+    for i in include_dirs:
+        options.append("-I" + i)
+
+    return compile_plain_musa(source, options, keep, mcc, cache_dir, target)
+
+
 class CudaModule:
     def _check_arch(self, arch):
         if arch is None:
@@ -357,6 +605,47 @@ class SourceModule(CudaModule):
         self._bind_module()
 
 
+class MusaModule(CudaModule):
+    """
+    Creates a Module from a single .mu source object compiled with mcc
+    against the MUSA runtime (Moore Threads equivalent of SourceModule).
+    """
+
+    def __init__(
+        self,
+        source,
+        mcc="mcc",
+        options=None,
+        keep=False,
+        no_extern_c=False,
+        arch=None,
+        code=None,
+        cache_dir=None,
+        include_dirs=None,
+    ):
+        if include_dirs is None:
+            include_dirs = []
+        self._check_arch(arch)
+
+        cubin = compile_musa(
+            source,
+            mcc,
+            options,
+            keep,
+            no_extern_c,
+            arch,
+            code,
+            cache_dir,
+            include_dirs,
+        )
+
+        from pycuda.driver import module_from_buffer
+
+        self.module = module_from_buffer(cubin)
+
+        self._bind_module()
+
+
 def _search_on_path(filenames):
     """Find file on system path."""
     # http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/52224
@@ -376,6 +665,11 @@ def _search_on_path(filenames):
 @memoize
 def _find_nvcc_on_path():
     return _search_on_path(["nvcc", "nvcc.exe"])
+
+
+@memoize
+def _find_mcc_on_path():
+    return _search_on_path(["mcc", "mcc.exe"])
 
 
 class DynamicModule(CudaModule):
@@ -492,6 +786,51 @@ class DynamicModule(CudaModule):
             )
         return libdir, libptn
 
+    def _locate_musa_libdir(self):
+        """
+        Locate the MUSA SDK library directory on the local file system.
+        Precedence:
+            Linux: cuda_libdir(reused) > $MUSA_ROOT > $LD_LIBRARY_PATH > /usr/local/musa/lib
+        Returns a pair (libdir, libptn).
+        """
+        from os.path import isfile, join
+        from platform import system as platform_system
+
+        system = platform_system()
+        libdir, libptn = None, None
+        if system == "Windows":
+            libptn = "%s.lib"
+        elif system in ["Linux", "Darwin"]:
+            if self.cuda_libdir is not None:
+                libdir = self.cuda_libdir
+            elif "MUSA_ROOT" in os.environ:
+                for candidate in ["lib64", "lib"]:
+                    candidate_dir = join(os.environ["MUSA_ROOT"], candidate)
+                    if isfile(join(candidate_dir, "libmusa.so")):
+                        libdir = candidate_dir
+                        break
+            elif "LD_LIBRARY_PATH" in os.environ:
+                for ld_path in os.environ["LD_LIBRARY_PATH"].split(":"):
+                    if isfile(join(ld_path, "libmusa.so")):
+                        libdir = ld_path
+                        break
+
+            if libdir is None and isfile("/usr/local/musa/lib/libmusa.so"):
+                libdir = "/usr/local/musa/lib"
+
+            if libdir is None:
+                mcc_path = _find_mcc_on_path()
+                if mcc_path is not None:
+                    libdir = join(os.path.dirname(mcc_path), "..", "lib")
+
+            libptn = "lib%s.so"
+        if libdir is None:
+            raise RuntimeError(
+                "Unable to locate the MUSA SDK installation "
+                "directory, set MUSA_ROOT environment variable"
+            )
+        return libdir, libptn
+
     def add_source(self, source, nvcc_options=None, name="kernel.ptx"):
         ptx = compile(
             source,
@@ -584,3 +923,7 @@ class DynamicSourceModule(DynamicModule):
         self.add_source(source, nvcc_options=options)
         self.add_stdlib("cudadevrt")
         self.link()
+
+
+# MUSA equivalent: MusaDynamicSourceModule is not provided because MUSA does not
+# support dynamic parallelism (cudadevrt equivalent). Use MusaModule for MUSA kernels.

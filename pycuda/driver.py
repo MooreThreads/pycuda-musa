@@ -11,7 +11,7 @@ import os
 import numpy as np
 
 
-# {{{ add cuda lib dir to Python DLL path
+# {{{ add musa/cuda lib dir to Python DLL path (Windows only)
 
 
 def _search_on_path(filenames):
@@ -30,32 +30,32 @@ def _search_on_path(filenames):
                 return abspath(join(path, filename))
 
 
-def _add_cuda_libdir_to_dll_path():
+def _add_musa_libdir_to_dll_path():
     from os.path import dirname, exists, join
 
-    cuda_path = os.environ.get("CUDA_PATH")
+    # Check for MUSA first (Moore Threads), then fall back to CUDA
+    musa_path = os.environ.get("MUSA_PATH") or os.environ.get("CUDA_PATH")
 
-    if cuda_path is not None:
-        # CUDA 13.0+ use bin/x64/ as dir
-        lib_dir = join(cuda_path, "bin", "x64")
+    if musa_path is not None:
+        lib_dir = join(musa_path, "bin", "x64")
         if exists(lib_dir):
             os.add_dll_directory(lib_dir)
         else:
-            os.add_dll_directory(join(cuda_path, "bin"))
+            os.add_dll_directory(join(musa_path, "bin"))
         return
 
-    nvcc_path = _search_on_path(["nvcc.exe"])
-    if nvcc_path is not None:
-        os.add_dll_directory(dirname(nvcc_path))
+    mcc_path = _search_on_path(["mcc.exe", "nvcc.exe"])
+    if mcc_path is not None:
+        os.add_dll_directory(dirname(mcc_path))
         return
 
     from warnings import warn
 
     warn(
-        "Unable to discover CUDA installation directory "
+        "Unable to discover MUSA/CUDA installation directory "
         "while attempting to add it to Python's DLL path. "
-        "Either set the 'CUDA_PATH' environment variable "
-        "or ensure that 'nvcc.exe' is on the path.", stacklevel=2
+        "Either set the 'MUSA_PATH' environment variable "
+        "or ensure that 'mcc.exe' is on the path.", stacklevel=2
     )
 
 
@@ -66,7 +66,7 @@ except AttributeError:
     # https://github.com/inducer/pycuda/issues/213
     pass
 else:
-    _add_cuda_libdir_to_dll_path()
+    _add_musa_libdir_to_dll_path()
 
 # }}}
 
